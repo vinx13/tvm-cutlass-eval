@@ -1,3 +1,4 @@
+import pickle
 import os
 import sys
 import torch
@@ -22,10 +23,15 @@ from tvm.ir import IRModule
 from tvm.runtime.ndarray import cpu, cuda
 from tvm.target.target import Target
 from tvm.contrib import graph_executor
-from tvm.meta_schedule import ReplayTraceConfig, EvolutionarySearchConfig
+from tvm.contrib.debugger import debug_executor
 from tvm.meta_schedule.database import PyDatabase, Workload, TuningRecord, JSONDatabase
-from tvm.meta_schedule.tune import tune_relay, tune_extracted_tasks, tune_tir
-from tvm.meta_schedule.integration import ApplyHistoryBest, extract_task_from_relay
+from tvm.meta_schedule.tune import (
+    tune_relay,
+    tune_extracted_tasks,
+    tune_tir,
+    TuneConfig,
+)
+from tvm.meta_schedule import ApplyHistoryBest, extract_task_from_relay
 from tvm.meta_schedule import schedule_rule as M
 from tvm.meta_schedule import postproc
 from tvm.meta_schedule.utils import derived_object
@@ -74,16 +80,6 @@ def should_use_memhammer(task):
     mod = task.dispatched[0]
     global_var = mod.get_global_vars()[0]
     task_name = global_var.name_hint
-    if task_name not in ["fused_nn.dense", "fused_nn.batch_matmul"]:
-        return False
-    prim_func = mod[global_var]
-    return check_params_tensorcore_compatible(prim_func)
-
-
-def should_use_tensorcore_fusion(task):
-    mod = task.dispatched[0]
-    global_var = mod.get_global_vars()[0]
-    task_name = global_var.name_hint
     if "dense" in task_name or "batch_matmul" in task_name:
         prim_func = mod[global_var]
         return check_params_tensorcore_compatible(prim_func)
@@ -101,13 +97,14 @@ def tune():
     # run tuning tasks
     print("Tuning...")
     memhammer_tasks = []
-    tensorcore_fusion_tasks = []
+    other_tasks = []
     for tsk in tasks:
         print(tsk.dispatched[0].script())
         if should_use_memhammer(tsk):
             memhammer_tasks.append(tsk)
-        elif should_use_tensorcore_fusion(tsk):
-            tensorcore_fusion_tasks.append(tsk)
+        else:
+            other_tasks.append(tsk)
+    # sys.exit(0)
 
     def sch_rules_tensor_core():
         return [
@@ -123,7 +120,7 @@ def tune():
                     scope="shared.dyn",
                 ),
                 reuse_write=M.ReuseType(
-                    req="must",
+                    req="no",
                     levels=[3],
                     scope="shared.dyn",
                 ),
@@ -155,35 +152,6 @@ def tune():
             ),
         ]
 
-    def sch_rules_tensor_core_memhammer():
-        return [
-            multi_level_tiling_memhammer_tensor_core(target=target),
-            M.AutoInline(
-                into_producer=True,
-                into_consumer=True,
-                inline_const_tensor=True,
-                disallow_if_then_else=False,
-                require_injective=False,
-                require_ordered=False,
-                disallow_op=None,
-            ),
-            M.CrossThreadReduction(thread_extents=[4, 8, 16, 32, 64, 128, 256, 512]),
-            M.ParallelizeVectorizeUnroll(
-                max_jobs_per_core=-1,  # disable parallelize
-                max_vectorize_extent=-1,  # disable vectorize
-                unroll_max_steps=[0, 16, 64, 512, 1024],
-                unroll_explicit=True,
-            ),
-        ]
-
-    def postprocs_no_tensor_core():
-        return [
-            postproc.RewriteCooperativeFetch(),
-            postproc.RewriteUnboundBlock(),
-            postproc.RewriteParallelVectorizeUnroll(),
-            postproc.RewriteReductionBlock(),
-            postproc.VerifyGPUCode(),
-        ]
 
     def postprocs_tensor_core():
         return [
@@ -195,34 +163,25 @@ def tune():
             postproc.VerifyGPUCode(),
         ]
 
-    search_config = EvolutionarySearchConfig(
+    search_config = TuneConfig(
         num_trials_per_iter=64,
-        max_trials_per_task=1000,
-        population_size=2048,
-        max_trials_global=2000,
-        init_measured_ratio=0.2,
-        init_min_unmeasured=50,
-        genetic_num_iters=3,
-        genetic_mutate_prob=0.85,
-        genetic_max_fail_count=10,
-        eps_greedy=0.05,
+        max_trials_per_task=500,
+        max_trials_global=3000,
+        search_strategy_config={
+            "population_size": 2048,
+            "init_measured_ratio": 0.2,
+            "init_min_unmeasured": 50,
+            "genetic_num_iters": 3,
+            "genetic_mutate_prob": 0.85,
+            "genetic_max_fail_count": 10,
+            "eps_greedy": 0.05,
+        },
     )
 
     with tempfile.TemporaryDirectory() as work_dir:
         database = JSONDatabase("db/workload.json", "db/record.json")
         tune_extracted_tasks(
             memhammer_tasks,
-            target=target,
-            config=search_config,
-            sch_rules=sch_rules_tensor_core_memhammer,
-            postprocs=postprocs_tensor_core,
-            work_dir=work_dir,
-            database=database,
-        )
-
-        tune_extracted_tasks(
-            tensorcore_fusion_tasks,
-            target=target,
             config=search_config,
             sch_rules=sch_rules_tensor_core,
             postprocs=postprocs_tensor_core,
@@ -232,7 +191,6 @@ def tune():
 
         tune_extracted_tasks(
             tasks,
-            target=target,
             config=search_config,
             # use default CUDA rules
             work_dir=work_dir,
@@ -244,22 +202,30 @@ def tune():
 
 def evaluate(lib):
     dev = tvm.device(str(target), 0)
+    
     module = runtime.GraphModule(lib["default"](dev))
 
     batch_size = 8
+    seq_len = 128
+    torch.manual_seed(1001)
     inputs = (
-        torch.randint(high=100, size=(batch_size, 128), dtype=torch.int64),
-        torch.randint(high=100, size=(batch_size, 128), dtype=torch.int64),
-        torch.randint(high=100, size=(batch_size, 128), dtype=torch.int64),
+        torch.randint(high=100, size=(batch_size, seq_len), dtype=torch.int64),
+        torch.randint(high=100, size=(batch_size, seq_len), dtype=torch.int64),
+        torch.randint(high=100, size=(batch_size, seq_len), dtype=torch.int64),
     )
+    pickle.dump(inputs, open('inputs.pkl','wb'))
+    inputs = pickle.load(open("inputs.pkl", "rb"))
 
     module.set_input("input_ids", inputs[0])
     module.set_input("attention_mask", inputs[1])
     module.set_input("token_type_ids", inputs[2])
     module.run()
-
+    # print(module.get_output(0))
+    # out = module.get_output(0).numpy()
     print("Evaluate inference time cost...")
     print(module.benchmark(dev, number=1, repeat=50))
+
+
 
 
 lib = tune()
